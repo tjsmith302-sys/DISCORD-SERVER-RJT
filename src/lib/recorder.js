@@ -42,12 +42,37 @@ export async function startRecording({ voiceChannel, meetingId, textChannel }) {
     selfMute: true,
   });
 
+  // Robust reconnection handler: on Disconnected, try to resume before giving up.
+  // Critical for Railway / hosts where Discord voice UDP is flaky.
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    try {
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+      log.info('Voice disconnect was a reconnect attempt — resuming.');
+    } catch {
+      log.warn('Voice disconnected with no reconnect — destroying.');
+      try { connection.destroy(); } catch {}
+    }
+  });
+
+  // Log every state transition so we can see exactly where it fails
+  connection.on('stateChange', (oldState, newState) => {
+    log.info(`Voice state: ${oldState.status} -> ${newState.status}`);
+  });
+
   try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+    // 30s timeout (up from 20s) — Railway cold-starts can take longer
+    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
   } catch (err) {
-    log.error('Voice connection never became Ready', err?.message, 'state=', connection.state?.status);
-    connection.destroy();
-    throw new Error(`Failed to connect to voice channel (status: ${connection.state?.status || 'unknown'}). Check bot permissions on the voice channel and voice region.`);
+    const finalState = connection.state?.status;
+    log.error(`Voice connection never became Ready. state=${finalState} err=${err?.message}`);
+    try { connection.destroy(); } catch {}
+    const hint = finalState === 'signalling' || finalState === 'connecting'
+      ? ' This is usually a hosting-region UDP issue. Try redeploying to us-east1 on Railway, or switch to Fly.io.'
+      : ' Check bot permissions on the voice channel.';
+    throw new Error(`Failed to connect to voice channel (stuck at: ${finalState}).${hint}`);
   }
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mbot-'));
