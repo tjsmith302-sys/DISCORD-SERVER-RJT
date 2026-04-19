@@ -2,14 +2,30 @@ import { createClient } from '@supabase/supabase-js';
 import { log } from './logger.js';
 
 const url = process.env.SUPABASE_URL;
-const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const rawKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+// Strip whitespace, quotes, and trailing newlines that Railway / copy-paste often add
+const key = rawKey?.trim().replace(/^["']|["']$/g, '');
 
 if (!url || !key) {
   log.warn('SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing — persistence disabled');
+} else {
+  const keyType = key.startsWith('sb_secret_') ? 'new-format secret'
+    : key.startsWith('sb_publishable_') ? 'new-format publishable'
+    : key.startsWith('eyJ') ? 'legacy JWT'
+    : 'unknown';
+  log.info(`Supabase key type: ${keyType} (length ${key.length})`);
 }
 
 export const supabase = url && key ? createClient(url, key, {
   auth: { persistSession: false, autoRefreshToken: false },
+  global: {
+    // Ensure headers are clean strings — new sb_secret_ keys fail if any
+    // whitespace/control chars sneak in from env var
+    headers: {
+      apikey: key,
+      Authorization: `Bearer ${key}`,
+    },
+  },
 }) : null;
 
 export async function createMeeting({ guildId, channelId, channelName, startedBy }) {
