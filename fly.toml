@@ -1,0 +1,14 @@
+app = "meeting-bot-rjt"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  LOG_CHANNEL_NAME = "meeting-logs"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  cpus = 1
