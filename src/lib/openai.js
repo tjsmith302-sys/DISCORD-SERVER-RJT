@@ -2,13 +2,21 @@ import OpenAI from 'openai';
 import fs from 'node:fs';
 import { log } from './logger.js';
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || 'whisper-1';
 const SUMMARY_MODEL = process.env.OPENAI_SUMMARY_MODEL || 'gpt-4o';
 
+let _client = null;
+function getClient() {
+  if (_client) return _client;
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) throw new Error('OPENAI_API_KEY is not set');
+  _client = new OpenAI({ apiKey: key });
+  return _client;
+}
+
 export async function transcribeFile(filePath) {
   try {
-    const resp = await client.audio.transcriptions.create({
+    const resp = await getClient().audio.transcriptions.create({
       file: fs.createReadStream(filePath),
       model: TRANSCRIBE_MODEL,
       response_format: 'json',
@@ -42,7 +50,7 @@ Respond ONLY with valid JSON of the shape:
 { "summary": "...", "action_items": [...], "decisions": [...] }`;
 
   try {
-    const resp = await client.chat.completions.create({
+    const resp = await getClient().chat.completions.create({
       model: SUMMARY_MODEL,
       temperature: 0.2,
       response_format: { type: 'json_object' },
