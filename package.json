@@ -20,6 +20,7 @@
     "dotenv": "^16.4.5",
     "ffmpeg-static": "^5.2.0",
     "form-data": "^4.0.0",
+    "sodium-native": "^4.3.1",
     "libsodium-wrappers": "^0.7.13",
     "node-fetch": "^3.3.2",
     "openai": "^4.67.0",
