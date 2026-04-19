@@ -1,5 +1,16 @@
 import 'dotenv/config';
-import { Client, GatewayIntentBits, Events, ChannelType, PermissionFlagsBits, AttachmentBuilder, EmbedBuilder } from 'discord.js';
+import {
+  Client,
+  GatewayIntentBits,
+  Events,
+  ChannelType,
+  PermissionFlagsBits,
+  AttachmentBuilder,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+} from 'discord.js';
 import { log } from './lib/logger.js';
 import {
   createMeeting,
@@ -10,6 +21,21 @@ import {
 } from './lib/supabase.js';
 import { summarizeMeeting } from './lib/openai.js';
 import { startRecording, stopRecording, getSession } from './lib/recorder.js';
+import {
+  parseNaturalDate,
+  createEvent,
+  cancelEvent,
+  listUpcomingEvents,
+  getEvent,
+  setRsvp,
+  getRsvps,
+  createReminder,
+  getTodaysEvents,
+  getThisWeeksEvents,
+  formatDiscordTime,
+  formatForTeam,
+} from './lib/calendar.js';
+import { startScheduler } from './lib/scheduler.js';
 
 const token = process.env.DISCORD_TOKEN;
 if (!token) {
@@ -29,17 +55,15 @@ const client = new Client({
 
 // Finds an existing #meeting-logs channel in the guild, or creates one.
 async function getOrCreateLogChannel(guild) {
-  // Try existing first (case-insensitive match on name)
   const existing = guild.channels.cache.find(c =>
     c.type === ChannelType.GuildText &&
     c.name.toLowerCase() === LOG_CHANNEL_NAME.toLowerCase()
   );
   if (existing) return existing;
 
-  // Check if bot has permission to create channels
   const me = guild.members.me;
   if (!me?.permissions.has(PermissionFlagsBits.ManageChannels)) {
-    log.warn(`Cannot create #${LOG_CHANNEL_NAME}: bot lacks Manage Channels permission. Falling back to original channel.`);
+    log.warn(`Cannot create #${LOG_CHANNEL_NAME}: bot lacks Manage Channels permission.`);
     return null;
   }
 
@@ -60,22 +84,30 @@ async function getOrCreateLogChannel(guild) {
 
 client.once(Events.ClientReady, (c) => {
   log.info(`Logged in as ${c.user.tag}. Listening for slash commands.`);
+  // Fire up the calendar scheduler (15-min reminders, auto-join, daily/weekly, personal reminders)
+  startScheduler(c, {
+    onVoiceAutoJoin: (event) => autoJoinForEvent(c, event),
+  });
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-  const { commandName, guildId } = interaction;
-
   try {
-    switch (commandName) {
-      case 'join':   return handleJoin(interaction);
-      case 'leave':  return handleLeave(interaction);
-      case 'summary':    return handleSummary(interaction);
-      case 'transcript': return handleTranscript(interaction);
-      case 'status': return handleStatus(interaction);
+    if (interaction.isChatInputCommand()) {
+      const { commandName } = interaction;
+      switch (commandName) {
+        case 'join':   return handleJoin(interaction);
+        case 'leave':  return handleLeave(interaction);
+        case 'summary':    return handleSummary(interaction);
+        case 'transcript': return handleTranscript(interaction);
+        case 'status': return handleStatus(interaction);
+        case 'event':  return handleEvent(interaction);
+        case 'remind': return handleRemind(interaction);
+      }
+    } else if (interaction.isButton()) {
+      return handleButton(interaction);
     }
   } catch (err) {
-    log.error(`Command ${commandName} failed`, err);
+    log.error(`Interaction failed`, err);
     const msg = `Error: ${err.message || 'unknown'}`;
     if (interaction.deferred || interaction.replied) {
       await interaction.editReply(msg).catch(() => {});
@@ -84,6 +116,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   }
 });
+
+// ============================================================
+// Meeting recording handlers (unchanged)
+// ============================================================
 
 async function handleJoin(interaction) {
   const member = interaction.member;
@@ -98,7 +134,6 @@ async function handleJoin(interaction) {
   await interaction.deferReply();
   log.info(`[/join] user=${interaction.user.id} channel=${voiceChannel.name} (${voiceChannel.id})`);
 
-  // Permission sanity check before we try to connect
   const me = interaction.guild.members.me;
   const perms = voiceChannel.permissionsFor(me);
   if (!perms?.has('Connect') || !perms?.has('Speak')) {
@@ -176,7 +211,6 @@ async function handleLeave(interaction) {
   const transcriptFile = buildTranscriptAttachment(transcript, finished.meetingId);
   const payload = { embeds: [embed], files: transcriptFile ? [transcriptFile] : [] };
 
-  // Post summary + transcript to #meeting-logs (or fall back to current channel)
   const logChannel = await getOrCreateLogChannel(interaction.guild);
   const target = logChannel || interaction.channel;
 
@@ -196,12 +230,10 @@ async function handleLeave(interaction) {
 }
 
 async function handleSummary(interaction) {
-  // Look up the most recent meeting anywhere in the guild (not just current channel)
   const meeting = await getLatestMeetingForGuild(interaction.guildId);
   if (!meeting) {
     return interaction.reply({ content: 'No past meetings found in this server.', ephemeral: true });
   }
-  // Older meetings only have `summary` text; parse bullets out of it for display.
   const storedSummary = meeting.summary || '_(no summary yet)_';
   const { headline, discussion_points } = splitStoredSummary(storedSummary);
   const embed = buildSummaryEmbed({
@@ -243,8 +275,283 @@ async function handleStatus(interaction) {
   });
 }
 
+// ============================================================
+// Calendar handlers
+// ============================================================
+
+async function handleEvent(interaction) {
+  const sub = interaction.options.getSubcommand();
+  switch (sub) {
+    case 'add':    return handleEventAdd(interaction);
+    case 'list':   return handleEventList(interaction);
+    case 'cancel': return handleEventCancel(interaction);
+    case 'today':  return handleEventToday(interaction);
+    case 'week':   return handleEventWeek(interaction);
+  }
+}
+
+async function handleEventAdd(interaction) {
+  const title = interaction.options.getString('title', true);
+  const whenInput = interaction.options.getString('when', true);
+  const description = interaction.options.getString('description');
+  const autoJoin = interaction.options.getBoolean('auto_join_voice') ?? false;
+  const voiceChannel = interaction.options.getChannel('voice_channel');
+
+  const startsAt = parseNaturalDate(whenInput);
+  if (!startsAt) {
+    return interaction.reply({
+      content: `❌ Couldn't understand "${whenInput}". Try: "tomorrow 3pm", "Friday 10am", or "April 25 2pm".`,
+      ephemeral: true,
+    });
+  }
+  if (startsAt.getTime() < Date.now() - 60_000) {
+    return interaction.reply({ content: '❌ That time is in the past.', ephemeral: true });
+  }
+  if (autoJoin && voiceChannel && voiceChannel.type !== ChannelType.GuildVoice) {
+    return interaction.reply({ content: '❌ `voice_channel` must be a voice channel.', ephemeral: true });
+  }
+
+  await interaction.deferReply();
+
+  const event = await createEvent({
+    guildId: interaction.guildId,
+    channelId: interaction.channelId,
+    createdBy: { id: interaction.user.id, username: interaction.user.username },
+    title,
+    description,
+    startsAt,
+    voiceAutoJoin: autoJoin,
+    voiceChannelId: voiceChannel?.id || null,
+  });
+
+  const embed = buildEventEmbed(event);
+  const row = buildRsvpRow(event.id);
+
+  await interaction.editReply({
+    content: `✅ Event created by <@${interaction.user.id}>`,
+    embeds: [embed],
+    components: [row],
+  });
+}
+
+async function handleEventList(interaction) {
+  const events = await listUpcomingEvents(interaction.guildId, { limit: 10 });
+  if (!events.length) {
+    return interaction.reply({ content: '📭 No upcoming events. Use `/event add` to create one.', ephemeral: true });
+  }
+  const embed = new EmbedBuilder()
+    .setColor(0x6366f1)
+    .setTitle('📅 Upcoming events')
+    .setDescription(events.map(ev =>
+      `• **${ev.title}** — ${formatDiscordTime(new Date(ev.starts_at), 'F')}${ev.voice_auto_join ? ' 🎙️' : ''}\n   ID: \`${ev.id}\``
+    ).join('\n\n'))
+    .setFooter({ text: `Showing ${events.length} event${events.length === 1 ? '' : 's'}` });
+  await interaction.reply({ embeds: [embed] });
+}
+
+async function handleEventCancel(interaction) {
+  const id = interaction.options.getString('id', true);
+  try {
+    const event = await cancelEvent(id, interaction.user.id);
+    await interaction.reply({ content: `🗑️ Cancelled **${event.title}**.` });
+  } catch (err) {
+    const isForbidden = err.forbidden;
+    await interaction.reply({
+      content: isForbidden ? '❌ Only the event creator can cancel it.' : `❌ ${err.message}`,
+      ephemeral: true,
+    });
+  }
+}
+
+async function handleEventToday(interaction) {
+  const events = await getTodaysEvents(interaction.guildId);
+  if (!events.length) {
+    return interaction.reply({ content: '☀️ Nothing on the calendar today.', ephemeral: true });
+  }
+  const embed = new EmbedBuilder()
+    .setColor(0x22c55e)
+    .setTitle("☀️ Today's agenda")
+    .setDescription(events.map(ev =>
+      `• ${formatDiscordTime(new Date(ev.starts_at), 't')} — **${ev.title}**${ev.voice_auto_join ? ' 🎙️' : ''}`
+    ).join('\n'));
+  await interaction.reply({ embeds: [embed] });
+}
+
+async function handleEventWeek(interaction) {
+  const events = await getThisWeeksEvents(interaction.guildId);
+  if (!events.length) {
+    return interaction.reply({ content: '📅 No events this week.', ephemeral: true });
+  }
+  const embed = new EmbedBuilder()
+    .setColor(0x6366f1)
+    .setTitle("📅 This week")
+    .setDescription(events.map(ev =>
+      `• ${formatDiscordTime(new Date(ev.starts_at), 'F')} — **${ev.title}**${ev.voice_auto_join ? ' 🎙️' : ''}`
+    ).join('\n'));
+  await interaction.reply({ embeds: [embed] });
+}
+
+async function handleRemind(interaction) {
+  const what = interaction.options.getString('what', true);
+  const whenInput = interaction.options.getString('when', true);
+  const remindAt = parseNaturalDate(whenInput);
+  if (!remindAt) {
+    return interaction.reply({
+      content: `❌ Couldn't understand "${whenInput}". Try: "in 2 hours", "tomorrow 9am", or "Friday 3pm".`,
+      ephemeral: true,
+    });
+  }
+  if (remindAt.getTime() < Date.now() - 60_000) {
+    return interaction.reply({ content: '❌ That time is in the past.', ephemeral: true });
+  }
+  await createReminder({
+    guildId: interaction.guildId,
+    channelId: interaction.channelId,
+    user: { id: interaction.user.id, username: interaction.user.username },
+    content: what,
+    remindAt,
+  });
+  await interaction.reply({
+    content: `⏰ Reminder set: **${what}** — ${formatDiscordTime(remindAt, 'F')} (${formatDiscordTime(remindAt, 'R')})`,
+    ephemeral: true,
+  });
+}
+
+// ============================================================
+// Button interactions (RSVP)
+// ============================================================
+
+async function handleButton(interaction) {
+  const [prefix, action, eventId] = interaction.customId.split(':');
+  if (prefix !== 'rsvp') return;
+
+  const statusMap = { going: 'going', maybe: 'maybe', notgoing: 'not_going' };
+  const status = statusMap[action];
+  if (!status) return;
+
+  const event = await getEvent(eventId);
+  if (!event) {
+    return interaction.reply({ content: '❌ Event not found.', ephemeral: true });
+  }
+
+  await setRsvp({
+    eventId,
+    userId: interaction.user.id,
+    username: interaction.user.username,
+    status,
+  });
+
+  // Update original embed with new RSVP counts
+  const rsvps = await getRsvps(eventId);
+  const updated = buildEventEmbed(event, rsvps);
+  const row = buildRsvpRow(eventId);
+
+  await interaction.update({ embeds: [updated], components: [row] });
+  const label = status === 'going' ? '✅ Going' : status === 'maybe' ? '🤔 Maybe' : '❌ Not going';
+  await interaction.followUp({ content: `<@${interaction.user.id}> — ${label}`, ephemeral: true });
+}
+
+function buildEventEmbed(event, rsvps = null) {
+  const embed = new EmbedBuilder()
+    .setColor(0x6366f1)
+    .setTitle(`📅 ${event.title}`)
+    .setDescription(event.description || '_(no description)_')
+    .addFields(
+      { name: 'When', value: formatDiscordTime(new Date(event.starts_at), 'F'), inline: true },
+      { name: 'Starts', value: formatDiscordTime(new Date(event.starts_at), 'R'), inline: true },
+    );
+  if (event.voice_auto_join) {
+    embed.addFields({
+      name: '🎙️ Auto-join voice',
+      value: event.voice_channel_id ? `<#${event.voice_channel_id}>` : 'Yes',
+      inline: true,
+    });
+  }
+  if (rsvps?.length) {
+    const going = rsvps.filter(r => r.status === 'going').map(r => `<@${r.user_id}>`);
+    const maybe = rsvps.filter(r => r.status === 'maybe').map(r => `<@${r.user_id}>`);
+    const no = rsvps.filter(r => r.status === 'not_going').map(r => `<@${r.user_id}>`);
+    const parts = [];
+    if (going.length) parts.push(`✅ **Going (${going.length}):** ${going.join(', ')}`);
+    if (maybe.length) parts.push(`🤔 **Maybe (${maybe.length}):** ${maybe.join(', ')}`);
+    if (no.length)    parts.push(`❌ **Not going (${no.length}):** ${no.join(', ')}`);
+    embed.addFields({ name: 'RSVPs', value: parts.join('\n') });
+  }
+  embed.setFooter({ text: `Event ID: ${event.id}` });
+  return embed;
+}
+
+function buildRsvpRow(eventId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`rsvp:going:${eventId}`).setLabel('Going').setEmoji('✅').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`rsvp:maybe:${eventId}`).setLabel('Maybe').setEmoji('🤔').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`rsvp:notgoing:${eventId}`).setLabel('Not going').setEmoji('❌').setStyle(ButtonStyle.Danger),
+  );
+}
+
+// ============================================================
+// Voice auto-join hook (called by scheduler at event time)
+// ============================================================
+
+async function autoJoinForEvent(client, event) {
+  const guild = await client.guilds.fetch(event.guild_id).catch(() => null);
+  if (!guild) return;
+
+  // Figure out which voice channel to join
+  let voiceChannel = null;
+  if (event.voice_channel_id) {
+    voiceChannel = await guild.channels.fetch(event.voice_channel_id).catch(() => null);
+  }
+  if (!voiceChannel) {
+    // Fallback: first voice channel with any members (likely the meeting)
+    voiceChannel = guild.channels.cache
+      .filter(c => c.type === ChannelType.GuildVoice && c.members.size > 0)
+      .first();
+  }
+  if (!voiceChannel) {
+    log.warn(`Auto-join skipped for event ${event.id}: no voice channel found`);
+    return;
+  }
+
+  if (getSession(guild.id)) {
+    log.info(`Auto-join skipped for event ${event.id}: already recording`);
+    return;
+  }
+
+  try {
+    const meeting = await createMeeting({
+      guildId: guild.id,
+      channelId: voiceChannel.id,
+      channelName: voiceChannel.name,
+      startedBy: event.created_by_user_id,
+    });
+    await startRecording({
+      voiceChannel,
+      meetingId: meeting.id,
+      textChannel: null,
+    });
+    log.info(`Auto-join: recording started for event ${event.id} in ${voiceChannel.name}`);
+
+    // Notify calendar channel
+    const calChannel = guild.channels.cache.find(c =>
+      c.type === ChannelType.GuildText &&
+      c.name.toLowerCase() === (process.env.CALENDAR_CHANNEL_NAME || 'calendar').toLowerCase()
+    );
+    if (calChannel) {
+      await calChannel.send({
+        content: `🎙️ Auto-joined **${voiceChannel.name}** for **${event.title}** — recording started. Run \`/leave\` when done.`,
+      });
+    }
+  } catch (err) {
+    log.error(`Auto-join failed for event ${event.id}`, err.message);
+  }
+}
+
+// ============================================================
+// Shared helpers
+// ============================================================
+
 function buildSummaryEmbed({ title, meetingId, channelName, startedAt, headline, discussion_points, summary, action_items, decisions }) {
-  // Description: headline TL;DR (falls back to summary text if no headline present)
   const description = headline && headline.trim()
     ? headline
     : truncate(summary || '_(no summary)_', 4000);
@@ -258,7 +565,6 @@ function buildSummaryEmbed({ title, meetingId, channelName, startedAt, headline,
       { name: 'Started', value: `<t:${Math.floor(startedAt.getTime()/1000)}:f>`, inline: true },
     );
 
-  // 💬 Discussion points — what was actually talked about
   if (discussion_points?.length) {
     const lines = discussion_points.slice(0, 15).map(p => `• ${p}`);
     embed.addFields({ name: '💬 What we discussed', value: truncate(lines.join('\n'), 1024) });
@@ -282,7 +588,6 @@ function buildSummaryEmbed({ title, meetingId, channelName, startedAt, headline,
   return embed;
 }
 
-// Parse legacy stored summary text (first non-bullet line = headline, bullet lines = points)
 function splitStoredSummary(text) {
   if (!text) return { headline: '', discussion_points: [] };
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
@@ -294,7 +599,6 @@ function splitStoredSummary(text) {
     } else if (!headline) {
       headline = line;
     } else {
-      // Additional non-bullet line: treat as a bullet too
       discussion_points.push(line);
     }
   }
