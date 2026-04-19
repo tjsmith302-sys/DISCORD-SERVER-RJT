@@ -96,3 +96,16 @@ export async function getLatestMeeting(guildId, channelId) {
   if (error) { log.error('getLatestMeeting failed', error); return null; }
   return data;
 }
+
+export async function getLatestMeetingForGuild(guildId) {
+  if (!supabase) return null;
+  const { data, error } = await supabase
+    .from('meetings')
+    .select('*')
+    .eq('guild_id', guildId)
+    .order('started_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) { log.error('getLatestMeetingForGuild failed', error); return null; }
+  return data;
+}
