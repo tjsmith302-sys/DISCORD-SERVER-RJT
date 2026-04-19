@@ -62,19 +62,42 @@ async function handleJoin(interaction) {
   }
 
   await interaction.deferReply();
+  log.info(`[/join] user=${interaction.user.id} channel=${voiceChannel.name} (${voiceChannel.id})`);
 
-  const meeting = await createMeeting({
-    guildId: interaction.guildId,
-    channelId: voiceChannel.id,
-    channelName: voiceChannel.name,
-    startedBy: interaction.user.id,
-  });
+  // Permission sanity check before we try to connect
+  const me = interaction.guild.members.me;
+  const perms = voiceChannel.permissionsFor(me);
+  if (!perms?.has('Connect') || !perms?.has('Speak')) {
+    log.warn(`Missing Connect/Speak perms in channel ${voiceChannel.id}`);
+    return interaction.editReply({
+      content: `❌ I don't have **Connect** and **Speak** permissions on ${voiceChannel.name}. Fix channel permissions and try again.`,
+    });
+  }
 
-  await startRecording({
-    voiceChannel,
-    meetingId: meeting.id,
-    textChannel: interaction.channel,
-  });
+  let meeting;
+  try {
+    meeting = await createMeeting({
+      guildId: interaction.guildId,
+      channelId: voiceChannel.id,
+      channelName: voiceChannel.name,
+      startedBy: interaction.user.id,
+    });
+    log.info(`Meeting row created id=${meeting.id}`);
+  } catch (err) {
+    log.error('createMeeting failed', err);
+    return interaction.editReply({ content: `❌ Supabase error: ${err.message}` });
+  }
+
+  try {
+    await startRecording({
+      voiceChannel,
+      meetingId: meeting.id,
+      textChannel: interaction.channel,
+    });
+  } catch (err) {
+    log.error('startRecording failed', err);
+    return interaction.editReply({ content: `❌ ${err.message}` });
+  }
 
   const embed = new EmbedBuilder()
     .setColor(0x22c55e)

@@ -4,6 +4,7 @@ import {
   VoiceConnectionStatus,
   entersState,
   getVoiceConnection,
+  generateDependencyReport,
 } from '@discordjs/voice';
 import prism from 'prism-media';
 import fs from 'node:fs';
@@ -13,6 +14,9 @@ import { pipeline } from 'node:stream/promises';
 import { log } from './logger.js';
 import { transcribeFile } from './openai.js';
 import { insertSegment } from './supabase.js';
+
+// Log voice dependencies once at startup so we can spot missing libs in deploy logs
+log.info('Voice dependency report:\n' + generateDependencyReport());
 
 const SILENCE_GAP_MS = parseInt(process.env.SILENCE_GAP_MS || '1500', 10);
 
@@ -41,8 +45,9 @@ export async function startRecording({ voiceChannel, meetingId, textChannel }) {
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
   } catch (err) {
+    log.error('Voice connection never became Ready', err?.message, 'state=', connection.state?.status);
     connection.destroy();
-    throw new Error('Failed to connect to voice channel.');
+    throw new Error(`Failed to connect to voice channel (status: ${connection.state?.status || 'unknown'}). Check bot permissions on the voice channel and voice region.`);
   }
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mbot-'));
