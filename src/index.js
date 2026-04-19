@@ -152,7 +152,7 @@ async function handleLeave(interaction) {
 
   const finished = await stopRecording(interaction.guildId);
   const transcript = await getTranscript(finished.meetingId);
-  const { summary, action_items, decisions } = await summarizeMeeting(transcript);
+  const { summary, headline, discussion_points, action_items, decisions } = await summarizeMeeting(transcript);
 
   await finalizeMeeting({
     meetingId: finished.meetingId,
@@ -166,6 +166,8 @@ async function handleLeave(interaction) {
     meetingId: finished.meetingId,
     channelName: finished.voiceChannel.name,
     startedAt: new Date(finished.startedAt),
+    headline,
+    discussion_points,
     summary,
     action_items,
     decisions,
@@ -199,12 +201,17 @@ async function handleSummary(interaction) {
   if (!meeting) {
     return interaction.reply({ content: 'No past meetings found in this server.', ephemeral: true });
   }
+  // Older meetings only have `summary` text; parse bullets out of it for display.
+  const storedSummary = meeting.summary || '_(no summary yet)_';
+  const { headline, discussion_points } = splitStoredSummary(storedSummary);
   const embed = buildSummaryEmbed({
     title: '📝 Last meeting summary',
     meetingId: meeting.id,
     channelName: meeting.channel_name,
     startedAt: new Date(meeting.started_at),
-    summary: meeting.summary || '_(no summary yet)_',
+    headline,
+    discussion_points,
+    summary: storedSummary,
     action_items: meeting.action_items || [],
     decisions: meeting.decisions || [],
   });
@@ -236,15 +243,31 @@ async function handleStatus(interaction) {
   });
 }
 
-function buildSummaryEmbed({ title, meetingId, channelName, startedAt, summary, action_items, decisions }) {
+function buildSummaryEmbed({ title, meetingId, channelName, startedAt, headline, discussion_points, summary, action_items, decisions }) {
+  // Description: headline TL;DR (falls back to summary text if no headline present)
+  const description = headline && headline.trim()
+    ? headline
+    : truncate(summary || '_(no summary)_', 4000);
+
   const embed = new EmbedBuilder()
     .setColor(0x6366f1)
     .setTitle(title)
-    .setDescription(truncate(summary, 4000))
+    .setDescription(truncate(description, 4000))
     .addFields(
       { name: 'Channel', value: channelName || 'Unknown', inline: true },
       { name: 'Started', value: `<t:${Math.floor(startedAt.getTime()/1000)}:f>`, inline: true },
     );
+
+  // 💬 Discussion points — what was actually talked about
+  if (discussion_points?.length) {
+    const lines = discussion_points.slice(0, 15).map(p => `• ${p}`);
+    embed.addFields({ name: '💬 What we discussed', value: truncate(lines.join('\n'), 1024) });
+  }
+
+  if (decisions?.length) {
+    const lines = decisions.slice(0, 10).map(d => `• ${d}`);
+    embed.addFields({ name: '📌 Decisions', value: truncate(lines.join('\n'), 1024) });
+  }
 
   if (action_items?.length) {
     const lines = action_items.slice(0, 15).map((a) => {
@@ -254,13 +277,28 @@ function buildSummaryEmbed({ title, meetingId, channelName, startedAt, summary, 
     });
     embed.addFields({ name: '✅ Action items', value: truncate(lines.join('\n'), 1024) });
   }
-  if (decisions?.length) {
-    const lines = decisions.slice(0, 10).map(d => `• ${d}`);
-    embed.addFields({ name: '📌 Decisions', value: truncate(lines.join('\n'), 1024) });
-  }
 
   embed.setFooter({ text: `Meeting ID: ${meetingId}` });
   return embed;
+}
+
+// Parse legacy stored summary text (first non-bullet line = headline, bullet lines = points)
+function splitStoredSummary(text) {
+  if (!text) return { headline: '', discussion_points: [] };
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  let headline = '';
+  const discussion_points = [];
+  for (const line of lines) {
+    if (line.startsWith('•') || line.startsWith('-') || line.startsWith('*')) {
+      discussion_points.push(line.replace(/^[•\-*]\s*/, ''));
+    } else if (!headline) {
+      headline = line;
+    } else {
+      // Additional non-bullet line: treat as a bullet too
+      discussion_points.push(line);
+    }
+  }
+  return { headline, discussion_points };
 }
 
 function buildTranscriptAttachment(segments, meetingId) {
