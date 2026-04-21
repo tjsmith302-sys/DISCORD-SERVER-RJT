@@ -45,32 +45,61 @@ async function tick(client, { onVoiceAutoJoin }) {
   ]);
 }
 
-// ---------- 15-min event reminders ----------
+// ---------- Tier-based event reminders ----------
+// Fires at every offset in the event's ReminderTier.offsetsMinutes (e.g. 1440, 60, 15)
 
 async function fireEventReminders(client) {
-  const events = await getEventsNeedingReminder();
-  for (const ev of events) {
+  const due = await getEventsNeedingReminder();
+  for (const ev of due) {
     try {
-      const guild = await client.guilds.fetch(ev.guild_id).catch(() => null);
+      const guildId = process.env.DISCORD_GUILD_ID;
+      const guild = await client.guilds.fetch(guildId).catch(() => null);
       if (!guild) continue;
-      const channel = findCalendarChannel(guild) || (ev.channel_id && await guild.channels.fetch(ev.channel_id).catch(() => null));
+      const channel = findCalendarChannel(guild) || (ev.channelId && await guild.channels.fetch(ev.channelId).catch(() => null));
       if (!channel) continue;
+
+      const offsetLabel = formatOffset(ev.offset_minutes);
+      const title = `⏰ ${offsetLabel} — ${ev.category_icon ? ev.category_icon + ' ' : ''}${ev.title}`;
+      const color = colorKeyToInt(ev.category_color) ?? 0xf59e0b;
+
       const embed = new EmbedBuilder()
-        .setColor(0xf59e0b)
-        .setTitle(`⏰ Starting in 15 min — ${ev.title}`)
+        .setColor(color)
+        .setTitle(title.slice(0, 250))
         .setDescription(ev.description || '_(no description)_')
         .addFields(
-          { name: 'When', value: formatDiscordTime(new Date(ev.starts_at), 'F'), inline: true },
-          { name: 'Starts', value: formatDiscordTime(new Date(ev.starts_at), 'R'), inline: true },
+          { name: 'When', value: formatDiscordTime(new Date(ev.startTime), 'F'), inline: true },
+          { name: 'Starts', value: formatDiscordTime(new Date(ev.startTime), 'R'), inline: true },
+          { name: 'Priority', value: ev.tier_name || 'Normal', inline: true },
         )
-        .setFooter({ text: `Event ID: ${ev.id}` });
-      await channel.send({ content: '@here', embeds: [embed] });
-      await markReminderSent(ev.id);
-      log.info(`15-min reminder sent for event ${ev.id}`);
+        .setFooter({ text: `Event ID: ${ev.event_id}` });
+
+      const mention = process.env.DISCORD_REMINDER_ROLE_ID
+        ? `<@&${process.env.DISCORD_REMINDER_ROLE_ID}>`
+        : '@here';
+      await channel.send({ content: mention, embeds: [embed] });
+      await markReminderSent(ev.event_id, ev.offset_minutes);
+      log.info(`Reminder sent: ${ev.title} (${offsetLabel} before)`);
     } catch (err) {
-      log.error(`Failed to fire reminder for event ${ev.id}`, err.message);
+      log.error(`Failed to fire reminder for event ${ev.event_id}`, err.message);
     }
   }
+}
+
+function formatOffset(min) {
+  if (min >= 10080 && min % 10080 === 0) return `${min / 10080} week${min === 10080 ? '' : 's'} before`;
+  if (min >= 1440 && min % 1440 === 0)   return `${min / 1440} day${min === 1440 ? '' : 's'} before`;
+  if (min >= 60 && min % 60 === 0)       return `${min / 60} hour${min === 60 ? '' : 's'} before`;
+  return `${min} min before`;
+}
+
+const COLOR_MAP = {
+  red: 0xef4444, amber: 0xf59e0b, yellow: 0xeab308, green: 0x22c55e,
+  emerald: 0x10b981, teal: 0x14b8a6, cyan: 0x06b6d4, sky: 0x0ea5e9,
+  blue: 0x3b82f6, indigo: 0x6366f1, violet: 0x8b5cf6, purple: 0xa855f7,
+  fuchsia: 0xd946ef, pink: 0xec4899, rose: 0xf43f5e, slate: 0x64748b,
+};
+function colorKeyToInt(key) {
+  return COLOR_MAP[key?.toLowerCase?.()] ?? null;
 }
 
 // ---------- Voice auto-join ----------
@@ -80,11 +109,11 @@ async function fireVoiceAutoJoins(client, onVoiceAutoJoin) {
   for (const ev of events) {
     try {
       if (!onVoiceAutoJoin) continue;
-      await markAutoJoinFired(ev.id); // mark first to avoid retry loops
+      await markAutoJoinFired(ev.event_id || ev.id); // mark first to avoid retry loops
       await onVoiceAutoJoin(ev);
-      log.info(`Voice auto-join fired for event ${ev.id}`);
+      log.info(`Voice auto-join fired for event ${ev.event_id || ev.id}`);
     } catch (err) {
-      log.error(`Voice auto-join failed for event ${ev.id}`, err.message);
+      log.error(`Voice auto-join failed for event ${ev.event_id || ev.id}`, err.message);
     }
   }
 }

@@ -294,6 +294,8 @@ async function handleEventAdd(interaction) {
   const title = interaction.options.getString('title', true);
   const whenInput = interaction.options.getString('when', true);
   const description = interaction.options.getString('description');
+  const tierId = interaction.options.getString('tier');
+  const categoryId = interaction.options.getString('category');
   const autoJoin = interaction.options.getBoolean('auto_join_voice') ?? false;
   const voiceChannel = interaction.options.getChannel('voice_channel');
 
@@ -320,6 +322,8 @@ async function handleEventAdd(interaction) {
     title,
     description,
     startsAt,
+    tierId,
+    categoryId,
     voiceAutoJoin: autoJoin,
     voiceChannelId: voiceChannel?.id || null,
   });
