@@ -291,51 +291,97 @@ async function handleEvent(interaction) {
 }
 
 async function handleEventAdd(interaction) {
-  const title = interaction.options.getString('title', true);
-  const whenInput = interaction.options.getString('when', true);
-  const description = interaction.options.getString('description');
-  const tierId = interaction.options.getString('tier');
-  const categoryId = interaction.options.getString('category');
-  const autoJoin = interaction.options.getBoolean('auto_join_voice') ?? false;
-  const voiceChannel = interaction.options.getChannel('voice_channel');
+  // Defer IMMEDIATELY — we have a 3-second window or Discord invalidates the interaction.
+  // Any work after deferReply has up to 15 minutes.
+  try {
+    await interaction.deferReply();
+  } catch (e) {
+    log.error('deferReply failed for /event add', e.message);
+    return;
+  }
 
-  const startsAt = parseNaturalDate(whenInput);
-  if (!startsAt) {
-    return interaction.reply({
-      content: `❌ Couldn't understand "${whenInput}". Try: "tomorrow 3pm", "Friday 10am", or "April 25 2pm".`,
-      ephemeral: true,
+  try {
+    const title = interaction.options.getString('title', true);
+    const startInput = interaction.options.getString('start', true);
+    const endInput = interaction.options.getString('end');
+    const description = interaction.options.getString('description');
+    const categoryId = interaction.options.getString('category');
+    const assigneesInput = interaction.options.getString('assignees');
+    const tierId = interaction.options.getString('priority');
+    const autoJoin = interaction.options.getBoolean('auto_join_voice') ?? false;
+    const voiceChannel = interaction.options.getChannel('voice_channel');
+
+    const startsAt = parseNaturalDate(startInput);
+    if (!startsAt) {
+      return interaction.editReply({
+        content: `❌ Couldn't understand start time "${startInput}". Try: "tomorrow 3pm", "Friday 10am", or "April 25 2pm".`,
+      });
+    }
+    if (startsAt.getTime() < Date.now() - 60_000) {
+      return interaction.editReply({ content: '❌ That start time is in the past.' });
+    }
+
+    let endsAt = null;
+    if (endInput) {
+      endsAt = parseNaturalDate(endInput);
+      if (!endsAt) {
+        return interaction.editReply({ content: `❌ Couldn't understand end time "${endInput}".` });
+      }
+      if (endsAt.getTime() <= startsAt.getTime()) {
+        return interaction.editReply({ content: '❌ End time must be after start time.' });
+      }
+    }
+
+    if (autoJoin && voiceChannel && voiceChannel.type !== ChannelType.GuildVoice) {
+      return interaction.editReply({ content: '❌ `voice_channel` must be a voice channel.' });
+    }
+
+    // Parse assignee @mentions: Discord renders them as <@123456789> in raw input
+    const assigneeDiscordIds = [];
+    if (assigneesInput) {
+      const re = /<@!?(\d+)>/g;
+      let m;
+      while ((m = re.exec(assigneesInput)) !== null) assigneeDiscordIds.push(m[1]);
+    }
+    const assignees = [];
+    for (const did of assigneeDiscordIds) {
+      try {
+        const u = await interaction.client.users.fetch(did);
+        assignees.push({ id: did, username: u.username });
+      } catch {
+        assignees.push({ id: did, username: `user_${did}` });
+      }
+    }
+
+    const event = await createEvent({
+      guildId: interaction.guildId,
+      channelId: interaction.channelId,
+      createdBy: { id: interaction.user.id, username: interaction.user.username },
+      title,
+      description,
+      startsAt,
+      endsAt,
+      tierId,
+      categoryId,
+      assignees,
+      voiceAutoJoin: autoJoin,
+      voiceChannelId: voiceChannel?.id || null,
     });
+
+    const embed = buildEventEmbed(event);
+    const row = buildRsvpRow(event.id);
+
+    await interaction.editReply({
+      content: `✅ Event created by <@${interaction.user.id}>`,
+      embeds: [embed],
+      components: [row],
+    });
+  } catch (err) {
+    log.error('handleEventAdd error', err);
+    try {
+      await interaction.editReply({ content: `❌ Failed to create event: ${err.message}` });
+    } catch {}
   }
-  if (startsAt.getTime() < Date.now() - 60_000) {
-    return interaction.reply({ content: '❌ That time is in the past.', ephemeral: true });
-  }
-  if (autoJoin && voiceChannel && voiceChannel.type !== ChannelType.GuildVoice) {
-    return interaction.reply({ content: '❌ `voice_channel` must be a voice channel.', ephemeral: true });
-  }
-
-  await interaction.deferReply();
-
-  const event = await createEvent({
-    guildId: interaction.guildId,
-    channelId: interaction.channelId,
-    createdBy: { id: interaction.user.id, username: interaction.user.username },
-    title,
-    description,
-    startsAt,
-    tierId,
-    categoryId,
-    voiceAutoJoin: autoJoin,
-    voiceChannelId: voiceChannel?.id || null,
-  });
-
-  const embed = buildEventEmbed(event);
-  const row = buildRsvpRow(event.id);
-
-  await interaction.editReply({
-    content: `✅ Event created by <@${interaction.user.id}>`,
-    embeds: [embed],
-    components: [row],
-  });
 }
 
 async function handleEventList(interaction) {
@@ -627,5 +673,17 @@ function truncate(s, n) {
 // Graceful shutdown
 process.on('SIGINT', async () => { await client.destroy(); process.exit(0); });
 process.on('SIGTERM', async () => { await client.destroy(); process.exit(0); });
+
+// Never let a single bad interaction or async failure crash the whole bot.
+// Fly was restarting the machine every time a slash-command handler threw.
+process.on('unhandledRejection', (reason) => {
+  log.error('[unhandledRejection]', reason instanceof Error ? reason.stack : reason);
+});
+process.on('uncaughtException', (err) => {
+  log.error('[uncaughtException]', err?.stack || err);
+});
+client.on('error', (err) => {
+  log.error('[discord client error]', err?.message || err);
+});
 
 client.login(token);

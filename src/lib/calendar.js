@@ -138,6 +138,7 @@ export async function createEvent({
   endsAt = null,
   tierId = null,
   categoryId = null,
+  assignees = [], // array of { id: discordId, username }
   voiceAutoJoin = false,
   voiceChannelId = null,
 }) {
@@ -159,6 +160,20 @@ export async function createEvent({
     [id, title, description, startsAt, endsAt, resolvedTierId, categoryId,
      userRowId, voiceAutoJoin, voiceChannelId, channelId],
   );
+
+  // Insert EventAssignee rows (matches rjtcal web "Who's this for?")
+  for (const a of assignees) {
+    try {
+      const aid = await ensureUser({ discordId: a.id, username: a.username });
+      await pool.query(
+        `INSERT INTO "EventAssignee" ("eventId", "userId") VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [id, aid],
+      );
+    } catch (e) {
+      console.error('[calendar/assignee insert failed]', a, e.message);
+    }
+  }
+
   return enrichEvent(r.rows[0], { guildId });
 }
 

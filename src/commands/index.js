@@ -1,7 +1,7 @@
 import { SlashCommandBuilder } from 'discord.js';
 
-// Note: tier/category choices are populated dynamically at registration time
-// from rjtcal's DB. See register-commands.js.
+// Tier/category choices are populated dynamically at registration time from
+// rjtcal's DB. See register-commands.js.
 export function buildCommandDefinitions({ tiers = [], categories = [] } = {}) {
   return [
     // --- Meeting recording commands ---
@@ -21,7 +21,7 @@ export function buildCommandDefinitions({ tiers = [], categories = [] } = {}) {
       .setName('status')
       .setDescription('Check whether the bot is currently recording in this server'),
 
-    // --- Calendar commands ---
+    // --- Calendar commands (mirror the rjtcal web "New event" form) ---
     new SlashCommandBuilder()
       .setName('event')
       .setDescription('Team calendar — schedule events synced with the rjtcal web app')
@@ -29,21 +29,52 @@ export function buildCommandDefinitions({ tiers = [], categories = [] } = {}) {
         const s = sub
           .setName('add')
           .setDescription('Create a new team event')
-          .addStringOption(o => o.setName('title').setDescription('Event title').setRequired(true))
-          .addStringOption(o => o.setName('when').setDescription('When? e.g. "tomorrow 3pm", "Friday 10am", "April 25 2pm"').setRequired(true))
-          .addStringOption(o => o.setName('description').setDescription('Optional notes'))
+          // --- Title ---
+          .addStringOption(o =>
+            o.setName('title').setDescription('Event title').setRequired(true))
+          // --- Start (required) ---
+          .addStringOption(o =>
+            o.setName('start')
+              .setDescription('Start — e.g. "tomorrow 3pm", "Friday 10am", "April 25 2pm"')
+              .setRequired(true))
+          // --- End (optional) ---
+          .addStringOption(o =>
+            o.setName('end')
+              .setDescription('End (optional) — same formats as start'))
+          // --- Description (optional) ---
+          .addStringOption(o =>
+            o.setName('description')
+              .setDescription('Notes, bullets, or checklist. Use "- [ ] item" for checkboxes'))
+          // --- Category (icon + color) ---
           .addStringOption(o => {
-            o.setName('tier').setDescription('Reminder priority tier');
-            for (const t of tiers.slice(0, 25)) o.addChoices({ name: t.name, value: t.id });
+            o.setName('category').setDescription('Pick an icon + color — Goal, Appointment, Meeting, or Task');
+            for (const c of categories.slice(0, 25)) {
+              o.addChoices({ name: `${c.icon} ${c.name}`, value: c.id });
+            }
             return o;
           })
+          // --- Assignees (Who's this for?) ---
+          .addStringOption(o =>
+            o.setName('assignees')
+              .setDescription("Who's this for? Mention teammates with @ (space-separated)"))
+          // --- Priority tier ---
           .addStringOption(o => {
-            o.setName('category').setDescription('Category (icon + color)');
-            for (const c of categories.slice(0, 25)) o.addChoices({ name: `${c.icon} ${c.name}`, value: c.id });
+            o.setName('priority').setDescription('Reminder tier — Important (14d/7d/1d/1h), Normal (7d/1d/1h), Low (2d/1h)');
+            for (const t of tiers.slice(0, 25)) {
+              const offsets = (t.offsetsMinutes || []).map(m =>
+                m >= 1440 ? `${Math.round(m/1440)}d` : m >= 60 ? `${Math.round(m/60)}h` : `${m}m`
+              ).join('/');
+              o.addChoices({ name: offsets ? `${t.name} — ${offsets} before` : t.name, value: t.id });
+            }
             return o;
           })
-          .addBooleanOption(o => o.setName('auto_join_voice').setDescription('Bot auto-joins voice at event time to transcribe'))
-          .addChannelOption(o => o.setName('voice_channel').setDescription('Which voice channel to auto-join'));
+          // --- Bot-only extras (below the fold) ---
+          .addBooleanOption(o =>
+            o.setName('auto_join_voice')
+              .setDescription('Bot auto-joins voice at start time to transcribe'))
+          .addChannelOption(o =>
+            o.setName('voice_channel')
+              .setDescription('Which voice channel to auto-join'));
         return s;
       })
       .addSubcommand(sub => sub.setName('list').setDescription('List upcoming events'))
@@ -63,5 +94,4 @@ export function buildCommandDefinitions({ tiers = [], categories = [] } = {}) {
 }
 
 // Backward-compat export for code that imports commandDefinitions directly.
-// Uses an empty tier/category list — register-commands.js builds the full version.
 export const commandDefinitions = buildCommandDefinitions();
