@@ -1,4 +1,4 @@
-# Meeting Bot — Discord Live Transcription & AI Summaries
+# v01dx-bot — V01DX Discord Bot (Transcription, Summaries, Calendar)
 
 A Discord bot that joins voice channels, transcribes every speaker live with **OpenAI Whisper**, then posts a **GPT-4o**-generated summary with action items and decisions to the channel when the meeting ends. Full transcripts are archived to **Supabase**. NotesBot / Memolin style.
 

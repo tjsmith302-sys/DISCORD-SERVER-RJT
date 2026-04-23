@@ -24,7 +24,7 @@ export function buildCommandDefinitions({ tiers = [], categories = [] } = {}) {
     // --- Calendar commands (mirror the rjtcal web "New event" form) ---
     new SlashCommandBuilder()
       .setName('event')
-      .setDescription('Team calendar — schedule events synced with the rjtcal web app')
+      .setDescription('Team calendar — schedule events synced with the V01DX web app')
       .addSubcommand(sub => {
         const s = sub
           .setName('add')
